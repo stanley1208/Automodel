@@ -71,6 +71,7 @@ from nemo_automodel.components.models.common.utils import (
     BackendConfig,
     initialize_linear_module,
     initialize_rms_norm_module,
+    restore_pretrained_generation_config,
 )
 from nemo_automodel.components.utils.model_utils import resolve_trust_remote_code, skip_random_init
 from nemo_automodel.shared.utils import dtype_from_str
@@ -1304,7 +1305,15 @@ def __init_model(
 
                     kwargs["backend"] = BackendConfig(**kwargs["backend"])
             with local_torch_dtype(torch_dtype, model_cls.__name__):
-                return True, model_cls(hf_config, *model_args, **kwargs)
+                model = model_cls(hf_config, *model_args, **kwargs)
+            if is_pretrained_init:
+                # Custom constructors only see the config. Restore the checkpoint's
+                # generation settings the way PreTrainedModel.from_pretrained does:
+                # generation_config.json carries stop tokens and sampling defaults that
+                # the config lacks, and the consolidated export writes
+                # model.generation_config back out.
+                restore_pretrained_generation_config(model, pretrained_model_name_or_path)
+            return True, model
 
     # 3. fallback to HF model class wrapped with mixin
     model = None

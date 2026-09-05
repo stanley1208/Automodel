@@ -24,11 +24,14 @@ from nemo_automodel.components.models.common.utils import (
     BackendConfig,
     TEFp8Config,
     compute_lm_head_logits,
+    generation_config_from_model_config,
     get_is_first_microbatch,
     get_is_optim_step,
     get_rope_config,
     initialize_linear_module,
     initialize_rms_norm_module,
+    load_pretrained_generation_config,
+    restore_pretrained_generation_config,
     set_is_first_microbatch,
     set_is_optim_step,
 )
@@ -406,3 +409,63 @@ class TestComputeLmHeadLogits:
         out = compute_lm_head_logits(lm_head, hidden, logits_to_keep=0, is_thd=True, output_hidden_states=True)
         assert out.hidden_states.shape == (1, 7, self.HIDDEN)
         torch.testing.assert_close(out.hidden_states, hidden.unsqueeze(0))
+
+
+class TestGenerationConfigHelpers:
+    def test_from_model_config_takes_stop_tokens_from_a_pretrained_config(self):
+        from transformers import PretrainedConfig
+
+        config = PretrainedConfig(bos_token_id=3, eos_token_id=[2, 11], pad_token_id=0)
+
+        generation_config = generation_config_from_model_config(config)
+
+        assert generation_config.bos_token_id == 3
+        assert generation_config.eos_token_id == [2, 11]
+        assert generation_config.pad_token_id == 0
+
+    def test_from_model_config_falls_back_to_defaults_for_plain_objects(self):
+        generation_config = generation_config_from_model_config(SimpleNamespace(eos_token_id=2))
+
+        assert generation_config.eos_token_id is None
+
+    def test_load_pretrained_returns_none_without_any_config_file(self, tmp_path):
+        assert load_pretrained_generation_config(tmp_path) is None
+
+    def test_load_pretrained_falls_back_to_the_generation_fields_of_config_json(self, tmp_path):
+        """Legacy checkpoints keep do_sample/temperature in config.json only; HF reads them from there."""
+        import json
+
+        (tmp_path / "config.json").write_text(
+            json.dumps({"model_type": "llama", "eos_token_id": 2, "do_sample": True, "temperature": 0.5})
+        )
+
+        generation_config = load_pretrained_generation_config(tmp_path)
+
+        assert generation_config.eos_token_id == 2
+        assert generation_config.do_sample is True
+        assert generation_config.temperature == 0.5
+
+    def test_restore_replaces_a_real_generation_config_only(self, tmp_path):
+        from transformers import GenerationConfig
+
+        GenerationConfig(eos_token_id=[2, 11]).save_pretrained(tmp_path)
+        can_generate = nn.Module()
+        can_generate.generation_config = GenerationConfig()
+        cannot_generate = nn.Module()
+
+        restore_pretrained_generation_config(can_generate, tmp_path)
+        restore_pretrained_generation_config(cannot_generate, tmp_path)
+
+        assert can_generate.generation_config.eos_token_id == [2, 11]
+        assert not hasattr(cannot_generate, "generation_config")
+
+    def test_load_pretrained_reads_the_checkpoint_generation_file(self, tmp_path):
+        from transformers import GenerationConfig
+
+        GenerationConfig(eos_token_id=[2, 11], do_sample=True, temperature=0.7).save_pretrained(tmp_path)
+
+        generation_config = load_pretrained_generation_config(tmp_path)
+
+        assert generation_config.eos_token_id == [2, 11]
+        assert generation_config.do_sample is True
+        assert generation_config.temperature == 0.7

@@ -22,6 +22,8 @@ from typing import Any, Literal, Protocol
 import torch
 from torch import nn
 from torch.distributed.fsdp import FSDPModule
+from transformers import PretrainedConfig
+from transformers.generation import GenerationConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel.shared.import_utils import safe_import, safe_import_from
@@ -81,6 +83,65 @@ def get_is_first_microbatch() -> bool | None:
         True/False/None indicating microbatch position for FP8 weight caching.
     """
     return IS_FIRST_MICROBATCH
+
+
+def generation_config_from_model_config(config) -> GenerationConfig:
+    """Generation config a custom causal LM starts with, seeded the way transformers does it.
+
+    ``PreTrainedModel.__init__`` derives ``generation_config`` from the model config so
+    the bos/eos/pad ids are set from the start. A custom model that builds a bare
+    ``GenerationConfig()`` instead has no stop token, and because the consolidated
+    export writes ``model.generation_config`` out as ``generation_config.json`` (which
+    beats ``config.json`` on reload), the exported model never stops generating either.
+    Configs that are not ``PretrainedConfig`` instances (test doubles) fall back to the defaults.
+    """
+    if not isinstance(config, PretrainedConfig):
+        return GenerationConfig()
+    try:
+        return GenerationConfig.from_model_config(config)
+    except NotImplementedError:
+        return GenerationConfig()
+
+
+def load_pretrained_generation_config(pretrained_model_name_or_path) -> GenerationConfig | None:
+    """The generation config a checkpoint carries, or ``None`` when it carries none.
+
+    Mirrors what ``PreTrainedModel.from_pretrained`` does once the weights are in:
+    ``generation_config.json`` wins when present, because that is where hub checkpoints
+    keep extra stop tokens (Nemotron-3 lists ``[2, 11]`` there but only ``2`` in
+    ``config.json``) and their sampling defaults. Without it, the generation fields of
+    the raw ``config.json`` are used, as HF does for legacy checkpoints that still keep
+    ``do_sample``/``temperature`` there (the in-memory config has already dropped them).
+    """
+    try:
+        return GenerationConfig.from_pretrained(pretrained_model_name_or_path)
+    except OSError:
+        logger.info(
+            "No generation_config.json in %s, using the generation fields of config.json.",
+            pretrained_model_name_or_path,
+        )
+    try:
+        return GenerationConfig.from_pretrained(
+            pretrained_model_name_or_path, config_file_name="config.json", _from_model_config=True
+        )
+    except (OSError, TypeError):
+        # transformers resolves a missing non-default config file to None and then
+        # fails to open it (TypeError) instead of raising OSError.
+        return None
+
+
+def restore_pretrained_generation_config(model: nn.Module, pretrained_model_name_or_path) -> None:
+    """Replace a model's ``generation_config`` with the one its checkpoint carries, if any.
+
+    Applies only to models that expose a real ``GenerationConfig`` (the ones that can
+    generate); a model without one, or a checkpoint without generation settings, is
+    left as it is.
+    """
+    if not isinstance(getattr(model, "generation_config", None), GenerationConfig):
+        return
+    generation_config = load_pretrained_generation_config(pretrained_model_name_or_path)
+    if generation_config is not None:
+        model.generation_config = generation_config
 
 
 def is_tensor_unallocated(tensor: torch.Tensor) -> bool:

@@ -21,6 +21,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 import torch.nn as nn
+from transformers.generation import GenerationConfig
 
 from nemo_automodel._transformers.model_init import (
     _apply_backend_module_overrides,
@@ -346,6 +347,119 @@ class TestPropagateTorchDtypeToSubconfigs:
         _propagate_torch_dtype_to_subconfigs(top, torch.float32)
 
         assert top.torch_dtype == torch.float32
+
+
+class TestCustomModelGenerationConfig:
+    """Registry models are built from the config alone; the loader restores the checkpoint's generation file."""
+
+    class _FakeModel(nn.Module):
+        def __init__(self, config, **kwargs):
+            super().__init__()
+            self.config = config
+            self.generation_config = GenerationConfig()
+
+    def _make_config(self):
+        config = MagicMock()
+        config.architectures = ["SomeModel"]
+        config.torch_dtype = "float32"
+        config.name_or_path = "fake/model"
+        return config
+
+    def _init_from(self, mock_resolve_cls, mock_get_hf_config, source):
+        mock_resolve_cls.return_value = self._FakeModel
+        mock_get_hf_config.return_value = self._make_config()
+        return _init_model(
+            cls=MagicMock(),
+            pretrained_model_name_or_path_or_config=source,
+            attn_implementation="sdpa",
+            torch_dtype=torch.float32,
+            quantization_config=None,
+            force_hf=False,
+        )
+
+    @patch("nemo_automodel._transformers.model_init.get_hf_config")
+    @patch("nemo_automodel._transformers.model_init._download_model_weights")
+    @patch("nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config")
+    def test_pretrained_path_restores_checkpoint_generation_config(
+        self, mock_resolve_cls, _mock_download, mock_get_hf_config, tmp_path
+    ):
+        GenerationConfig(eos_token_id=[2, 11], do_sample=True).save_pretrained(tmp_path)
+
+        is_custom, model = self._init_from(mock_resolve_cls, mock_get_hf_config, str(tmp_path))
+
+        assert is_custom is True
+        assert model.generation_config.eos_token_id == [2, 11]
+        assert model.generation_config.do_sample is True
+
+    @patch("nemo_automodel._transformers.model_init.get_hf_config")
+    @patch("nemo_automodel._transformers.model_init._download_model_weights")
+    @patch("nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config")
+    def test_pretrained_path_without_any_config_file_keeps_the_model_default(
+        self, mock_resolve_cls, _mock_download, mock_get_hf_config, tmp_path
+    ):
+        is_custom, model = self._init_from(mock_resolve_cls, mock_get_hf_config, str(tmp_path))
+
+        assert is_custom is True
+        assert model.generation_config.eos_token_id is None
+
+    @patch("nemo_automodel._transformers.model_init.get_hf_config")
+    @patch("nemo_automodel._transformers.model_init._download_model_weights")
+    @patch("nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config")
+    def test_pretrained_path_falls_back_to_config_json_generation_fields(
+        self, mock_resolve_cls, _mock_download, mock_get_hf_config, tmp_path
+    ):
+        import json
+
+        (tmp_path / "config.json").write_text(json.dumps({"model_type": "llama", "eos_token_id": 7}))
+
+        _, model = self._init_from(mock_resolve_cls, mock_get_hf_config, str(tmp_path))
+
+        assert model.generation_config.eos_token_id == 7
+
+    @patch("nemo_automodel._transformers.model_init.get_hf_config")
+    @patch("nemo_automodel._transformers.model_init._download_model_weights")
+    @patch("nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config")
+    def test_models_without_a_real_generation_config_are_left_alone(
+        self, mock_resolve_cls, _mock_download, mock_get_hf_config, tmp_path
+    ):
+        """The restore is gated on a real GenerationConfig, so a model that cannot generate never touches the hub."""
+        GenerationConfig(eos_token_id=[2, 11]).save_pretrained(tmp_path)
+        placeholder = MagicMock()
+        mock_resolve_cls.return_value = lambda config, **kwargs: placeholder
+        mock_get_hf_config.return_value = self._make_config()
+
+        _, model = _init_model(
+            cls=MagicMock(),
+            pretrained_model_name_or_path_or_config=str(tmp_path),
+            attn_implementation="sdpa",
+            torch_dtype=torch.float32,
+            quantization_config=None,
+            force_hf=False,
+        )
+
+        assert model is placeholder
+        assert not isinstance(model.generation_config, GenerationConfig)
+
+    @patch("nemo_automodel._transformers.model_init._download_model_weights")
+    @patch("nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config")
+    def test_config_build_does_not_look_for_a_checkpoint(self, mock_resolve_cls, _mock_download, tmp_path):
+        """A from_config build must ignore a checkpoint that happens to sit at config.name_or_path."""
+        GenerationConfig(eos_token_id=[2, 11]).save_pretrained(tmp_path)
+        mock_resolve_cls.return_value = self._FakeModel
+        config = self._make_config()
+        config.name_or_path = str(tmp_path)
+
+        is_custom, model = _init_model(
+            cls=MagicMock(),
+            pretrained_model_name_or_path_or_config=config,
+            attn_implementation="sdpa",
+            torch_dtype=torch.float32,
+            quantization_config=None,
+            force_hf=False,
+        )
+
+        assert is_custom is True
+        assert model.generation_config.eos_token_id is None
 
 
 class TestBackendDictCoercion:
